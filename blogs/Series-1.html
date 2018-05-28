@@ -1,0 +1,370 @@
+<h1> Spark SQL streaming to process streams with 100s of different schemas and sources.</h1>
+
+<p>
+Apache Spark structured streaming(a.k.a latest form of Spark streaming) is seeing some adoption, it is important to discuss best practices and how things can be done idiomatically. This blog is first in series, based on authors interaction with developers from different projects across IBM. This blog discusses: 
+<ul>
+<li><em>Problems with processing multiple streaming sources with same schema.</em>
+</li>
+<li><em>What happens when each of the stream has different schema, and there are hundereds of them.</em></li>
+</ul>
+
+<p>
+Quite often, there is a request to add an Apache Spark (TM) structured streaming connector for a message queue X or a streaming source Y. Sometimes the need for the connector is just unavoidable. For example, there is a cloud provider and he is offering his own implementation of a feature rich, scalable, distributed message queue and comes with support. In such a situation, one gets lot of benefits by using the provider's message queue - than having another software stack with its own operation overhead and not to mention the cost. To name a few, Amazon Kinesis and IBM Message Hub are examples of this.</p>
+
+<p>
+Message Hub, has an excellent integration with Apache Spark, and Kinesis support is also receiving a lot of attention from developers. Apart from special cases like this, in general, it is not always required to write a connector for a message queue X, in order to be able to use it. The reason is, each of them comes with a feature set different from others and may not even have throughput characterstics or reliability offered by some of the distributed queues. Their usage for a particular application is well justified, but may not have all the features that spark needs to offer its full capabilities. For example, some message queues, may not allow an API to read from a range of offsets or may not have a concept of distributed/parallel readers. In such cases, it is a best practice to route the messages to spark through a already well integrated and supported message queue like Apache Kafka. By trying to directly implement a connector for message queue X, one may lose out on reliability and performance guarantees that Apache Spark offers, or the connector may turn out to be pretty complex to develop and thus maintain.</p>
+<p>
+By routing the messages via another well integrated queue, application does not need a new connector and the overhead of implementing one. In-fact, most message queues can be easily routed via a Kafka message queue. A case in point can be Mqtt, which has good characteristics for light weight messaging in IOT devices, but does not have distributed support or persistence - at least, at the specification level. Trying to make Mqtt a complex reliable distributed message queue is much more effort than letting it do what it does best and route the low traffic messages coming from all the individual Mqtt queues via a scalable distributed message queue like Kafka, for processing with Apache Spark structured streaming. There are many other message queues, like ActiveMQ, RabbitMQ etc, which provide AMQP compliance but may not have the same kind of integration that Kafka has.
+</p>
+<p>This blog further demonstrates, how this can be done in practice with some real world examples.</p>
+
+<h2>(I) Classic word count example using Spark structured streaming for messages coming from single Mqtt queue by routing via kafka.</h2>
+
+<p>
+This example illustrates use case of using mqtt stream with spark structured streaming.
+A non distributed message queue, may lead to downtime .e.g. during a node failure. It is thus a best practice, to use kafka queue as a medium to spark. In-fact, many such streams can be directed using a single kafka queue. In this example, we keep things simple, the next example illustrates that point.
+</p>
+
+<ol>
+<li> <p>Create Spark session. </p>
+<!--IMP: Note to the reviewer, pre and code tags are both important here for HighlightJS to work, at some point highlight js might just support scala lang. -->
+
+<pre>
+<code class="scala">
+  val spark = SparkSession
+      .builder.master("local[4]")
+      .appName("SparkKafkaStreamingJob")
+      .getOrCreate()
+</code>
+</pre>
+</li>
+<li>
+<p>Setup a Mqtt to Kafka service, by registering a callback with Mqtt.</p>
+
+<pre>
+<code class="scala">
+    import spark.implicits._
+    val mqttTopic = "test"
+    val mqttBrokerUrl = "tcp://localhost:1883"
+    val kafkaTopic = "test"
+    val kafkaServer = "localhost:9092"
+    // Publish every message received from mqtt to Kafka.
+    
+    MqttToKafkaService.mqttToKafka(mqttTopic, mqttBrokerUrl, kafkaTopic, kafkaServer, Array[Byte]())
+</code></pre>
+</li>
+<li><p>Now we can calculate wordcounts on streaming data frame, connected to kafka queue with topic <code>test</code>.</p>
+ 
+<pre><code class="scala">
+    // Create DataSet representing the stream of input lines from kafka
+    val lines = spark
+      .readStream
+      .format("kafka")
+      .option("kafka.bootstrap.servers", kafkaServer)
+      .option("subscribe", kafkaTopic)
+      .load()
+      .selectExpr("CAST(value AS STRING)")
+      .as[String]
+
+    // Calculate wordcounts.
+    val wordCounts = lines.flatMap(_.split(" ")).groupBy("value").count()
+
+    // Start running the query that prints the running counts to the console
+    val query = wordCounts.writeStream
+      .outputMode("complete")
+      .format("console")
+      .option("checkpointLocation", "/tmp/temporary-" + UUID.randomUUID.toString)
+      .start()
+
+    query.awaitTermination()
+</code></pre>
+</li>
+</ol>
+<h3> To test this application. </h3>
+
+<ol>
+<li>
+ <p>First download and extract or clone the repository from Github link above. Using sbt. (Sbt can be obtained and installed by following the instructions <a href="https://www.scala-sbt.org/1.x/docs/Setup.html" rel="noopener" target="_blank">here</a>). If Apache Maven build system is a preferred choice, project can also be built using Maven, as the project comes with a pom.xml build file. For brevity, blog only mentions the usage instructions for sbt users.
+</p>
+<p><i>
+We need three open command line terminals.</i> (Assuming a kafka service is already available, and it is up and running locally, with topic test. <a href="http://kafka.apache.org/quickstart" rel="noopener" target="_blank">quickstart</a>)
+</p>
+<ul>
+<li>
+<p> On terminal one, run MQTT server. </p>
+
+<pre><code>
+    cd streaming-integration-pattern
+    sbt "run-main org.codait.streaming.mqtt.MQTTServer"
+</pre></code>
+</li>
+<li>
+<p> On terminal two, run Spark job can be run as.</p>
+<pre><code>
+    sbt "run-main org.codait.streaming.SparkJobSimple <kafka broker address> <MQTT broker address>"
+</code></pre>
+Substituting the default values for kafka and Mqtt broker address
+<pre><code>
+    sbt "run-main org.codait.streaming.SparkJobSimple localhost:9092 tcp://localhost:1883"
+</code></pre>
+<em>Please note: Recommended method for submitting jobs to Spark is via spark-submit script. More details on the <a href="http://spark.apache.org/docs/latest/submitting-applications.html" rel="noopener" target="_blank">link</a>. For brevity and convenience, we are using sbt for running locally.</em>
+</li>
+<li>
+<p> On third terminal, Publish to Mqtt.</p>
+<pre><code>
+    sbt "run-main org.codait.streaming.mqtt.MQTTPublisher"
+</pre></code>
+
+</li></ul>
+</li>
+<li><p>
+On spark console observe Wordcounts appearing, like this.
+</p>
+
+
+<pre><code>
+     -------------------------------------------
+     Batch: 1
+     -------------------------------------------
+     +-----+-----+
+     |value|count|
+     +-----+-----+
+     |World|    1|
+     |Hello|    1|
+     +-----+-----+
+</pre></code>
+
+<i>Please see <code>SparkJobSimple.scala</code> for full example.</i>
+
+</li></ol>  
+
+
+
+<h2>(II) Processing multiple streams using Spark structured streaming.</h2>
+<p>
+If there are two streams with different schemas, producing at different rate, and even disparate sources. How to handle such situations? One would be tempted to say, by having two different spark structured streaming jobs for each stream.</br>
+But, how to handle such situations when there are 100 and even thousands such "ultra low throughput streams", which put together results in significant throughput. By having a separate job for each stream, one would essentially waste a lot of resources in scheduling overhead or jobs holding up resources even when not in use.
+</p>
+<p>
+The example <code>SparkJobMultiStreams.scala</code> illustrates the point with just two stream and thus can become a starting point for someone implementing multiple stream.
+</p> <!--TODO: Provide actual link to the file, once code is hosted on github. -->
+<p>
+In the example, we first start two parallel tasks, each of them forwards the messages received at Mqtt receiver to kafka queue. These messages are distinguished from each other via a prepended bit. Then each message stream is seperated and processed differently, based on their schemas. One stream, counts the unique entries based on year for car records, and other computes max, min and average age for customer records. The output is generated on the console. This can be easily configured to be directed to another db or queue(s).
+</p>
+
+<ol>
+<li>
+<p>Launch parallel tasks, to read from input mqtt sources and relay each message to respective kafka message queue topics. </p>
+<p> Once spark session is created as previous example and available as <code>spark</code>. We can proceed as follows:
+</p>
+<pre><code style="scala">    
+    // Begin accumulating messages on two different partitions of spark. As two long running
+    // tasks. These tasks simply relay the messages arriving at mqtt streams to kafka topics.
+    // The two tasks are run in parallel, based on availability of cores.
+    spark.sparkContext.parallelize(Seq(0, 1), 2).mapPartitionsWithIndex { (x, y) =>
+      if( (x + 2) % 2 == 0)
+        MqttToKafkaService.mqttToKafka(mqttTopic, mqttBrokerUrl, kafkaTopic, kafkaServer,
+          "0".getBytes())
+      else
+        MqttToKafkaService.mqttToKafka(mqttTopic2, mqttBrokerUrl, kafkaTopic2, kafkaServer,
+          "1".getBytes())
+        Seq(true).toIterator
+    }.collectAsync()
+</pre></code>
+
+<p> Here we have used, old RDD API to simply run two tasks in parallel inside spark executors, on two different partitions. <code>collectAsync</code> ensures, that we do not block there for these long running tasks to finish. An important point to note, each message here is prepended with bit - "0" and "1" to distinguish later the origin of these messages. There are better ways to do it(using topic), but this is nevertheless most simple and general.</p>
+</li>
+
+<li>
+<p> Next, we create the dataset reading from kafka topic. In our example, Kafka does not interpret the messages and deals with them as bytes. To create string from those bytes we do <code>.selectExpr("CAST(value AS STRING)")</code>. This step would be very different in case the format of incoming messages is something other than pure strings converted to bytes. How to deal with various deserializing techniques, is out of scope for this blog and may be covered in a different blog post.
+</p>
+<p>Note: Once the messages have entered the Kafka queue, we do not need to deal with connecting to Mqtt queues.</p>
+<pre><code>
+    // Create DataSet representing all the incoming messages from kafka from different topics.
+    val mainInputStream = spark
+      .readStream
+      .format("kafka")
+      .option("kafka.bootstrap.servers", kafkaServer)
+      .option("subscribe", s"$kafkaTopic,$kafkaTopic2")
+      .load()
+      .selectExpr("CAST(value AS STRING)")
+      .as[String]
+</pre></code>
+</li>
+<li>
+<p>
+Once we have the streaming dataframe called <code>mainInputStream</code>, we can separate the two incoming streams for different processing schemes by checking the prepend bit set in the step 1.
+</p>
+<p> On the two different stream we parse the csv strings, and apply the following schemas according to their topic of origin. </p>
+
+<p><p><strong>Schema for topic 1, customerRecords:</strong></p>
+<table>
+  <tr>
+    <th>Field Names</th>
+    <th>Field Types</th>
+  </tr>
+  <tr>
+    <td>Id</td>
+    <td>String</td>
+  </tr>
+  <tr>
+    <td>Name</td>
+    <td>String</td>
+  </tr>
+  <tr>
+    <td>Age</td>
+    <td>Number</td>
+  </tr>
+  <tr>
+    <td>Gender</td>
+    <td>String</td>
+  </tr>
+</table>
+</p>
+<p><p><strong>Schema for topic 2, carRecords: </strong></p>
+<table>
+  <tr>
+    <th>Field Names</th>
+    <th>Field Types</th>
+  </tr>
+  <tr>
+    <td>Id</td>
+    <td>String</td>
+  </tr>
+  <tr>
+    <td>Make</td>
+    <td>String</td>
+  </tr>
+  <tr>
+    <td>Model</td>
+    <td>String</td>
+  </tr>
+  <tr>
+    <td>Year</td>
+    <td>Number</td>
+  </tr>
+</table>
+</p>
+
+<pre><code>
+    // First stream has schema for customer records. 
+    val topic1Messages = mainInputStream.filter(x => x.startsWith("0")).flatMap {
+      x => val array = x.replaceFirst("0", "").split(",")
+        if (array.length == 4) {
+          Some(array)
+        } else {
+          None
+        }
+    }.map(x => (x(0), x(1), Integer.parseInt(x(2).trim), x(3)))
+      .as[(String, String, Int, String)]
+      .toDF("Id", "Name", "Age", "Gender")
+      .groupBy($"Gender").agg(min("age"), max("age"), avg("age"), count("Name"))
+
+    // Second stream has schema for car records.
+    val topic2Messages: DataFrame = mainInputStream.filter(x => x.startsWith("1")).flatMap {
+      x => val array = x.replaceFirst("1", "").split(",")
+        if (array.length == 4) {
+          Some(array)
+        } else {
+          None
+        }
+    }.map(x => (x(0), x(1), x(2), Integer.parseInt(x(3))))
+      .as[(String, String, String, Int)]
+      .toDF("Id", "Make", "Model", "Year")
+      .groupBy($"Make", $"Model", $"Year").agg($"Make", $"Model", count("Year"))
+
+</pre></code>
+</li>
+<li><p>Lastly, these streams can be started as follows.</p>
+<pre><code>
+    // Start running the query for topic1 that prints the running counts to the console
+    val query = startConsoleStream(topic1Messages)
+
+    // Start running the query for topic2 that prints the running counts to the console
+    val query2 = startConsoleStream(topic2Messages)
+</pre></code>
+
+<p> In this example, they are configured to output on console, this can be easily changed to output to another message queue or even a Database.</p>
+</li>
+</ol>
+
+<h3> To test this application. </h3>
+<ol>
+<li>
+<p>
+First download or clone the repository from Github link above. Using sbt. (Sbt can be obtained and installed by following the instructions <a href="https://www.scala-sbt.org/1.x/docs/Setup.html" rel="noopener" target="_blank">here</a>).
+</p>
+<p><i>
+We need three open command line terminals.</i> (Assuming a kafka service is already available, and it is up and running locally, with topic set to - <code>autocreate</code>. <a href="http://kafka.apache.org/quickstart" rel="noopener" target="_blank">quickstart</a>)
+</p>
+<ul>
+<li>
+<p>
+On terminal one, run MQTT server. 
+</p>
+<pre><code>
+    cd streaming-integration-pattern
+    sbt "run-main org.codait.streaming.mqtt.MQTTServer"
+</pre></code> 
+</li>
+<li>
+<p> On terminal two, run Spark job.</p>
+<pre><code>
+    sbt "run-main org.codait.streaming.SparkJobMultiStreams localhost:9092 tcp://localhost:1883"
+</pre></code>
+<p>
+This will let Spark job connect to the kafka broker at localhost:9092 and mqtt receiver at tcp://localhost:1883. Please replace these values, based on your setup - if required.
+</p>
+<em>Please note: Recommended method for submitting jobs to Spark is via spark-submit script. More details on the <a href="http://spark.apache.org/docs/latest/submitting-applications.html" rel="noopener" target="_blank">link</a>. For brevity and convenience, we are using sbt for running locally.</em>
+</li>
+<li>
+<p> On third terminal, Publish to Mqtt.</p>
+
+<pre><code>
+    sbt "run-main org.codait.streaming.mqtt.MQTTPublisher customerRecords 1,PS,29,M localhost:1883 1"
+</pre></code>
+<p>
+
+Pushes one record to the mqtt queue with topic customerRecord, with name PS and age 29.
+</p>
+<pre><code>
+    sbt "run-main org.codait.streaming.mqtt.MQTTPublisher carRecords 2,Ford,Escort,2000 localhost:1883 1"
+</pre></code>
+
+<p>Pushes one record to the mqtt queue with topic carRecord, with name Ford Escort and year 2000.
+</p>
+</li></ul>
+<li>
+<p>
+On spark console observe output is different for two separate analysis.
+</p>
+<pre><code>
+          -------------------------------------------
+          Batch: 3
+          -------------------------------------------
+
+          +------+--------+--------+--------+-----------+
+          |Gender|min(age)|max(age)|avg(age)|count(Name)|
+          +------+--------+--------+--------+-----------+
+          |M     |29      |29      |29.0    |1          |
+          +------+--------+--------+--------+-----------+
+
+          -------------------------------------------
+          Batch: 3
+          -------------------------------------------
+
+          +----+------+----+----+------+-----------+
+          |Make|Model |Year|Make|Model |count(Year)|
+          +----+------+----+----+------+-----------+
+          |Ford|Escort|2000|Ford|Escort|2          |
+          +----+------+----+----+------+-----------+
+</pre></code>
+
+
+<p>
+<i>Please see <code>SparkJobMultiStreams.scala</code> for full example.</i></p>
+
+</li>
+</ol>
+
+<p> <strong>Summary:</strong> Above examples can form the basis for applying Spark streaming to various customer solutions, which are complicated by large number of different sources and sinks. In this way, a lot of less throughput jobs can be multiplexed into a single Spark streaming Job. Next in the series, I can talk more about Serialization, how to deal with erroneous records, databases as sinks and more.</p>
